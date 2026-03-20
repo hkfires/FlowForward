@@ -22,6 +22,16 @@ ok()   { echo -e "${GREEN}✔ $*${NC}"; }
 info() { echo -e "${CYAN}→ $*${NC}"; }
 pause(){ read -rp "  按回车继续..." _; }
 
+# 校验 IPv4 地址（格式 + 每段 0-255）
+valid_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local i
+    for i in "${BASH_REMATCH[@]:1}"; do
+        (( i <= 255 )) || return 1
+    done
+}
+
 # ── 备注管理 ─────────────────────────────────────────────────
 NOTES_FILE="/etc/iptables/forward-notes.conf"
 
@@ -117,19 +127,17 @@ check_deps() {
 # ── 规则解析 ─────────────────────────────────────────────────
 # 输出格式（每行）：proto local_port dest_ip dest_port
 get_rules() {
-    iptables -t nat -L PREROUTING -n 2>/dev/null \
-        | grep -E '^\s*DNAT' \
-        | while read -r line; do
-            local proto dport dest dest_ip dest_port
-            proto=$(echo "$line" | awk '{print $2}')
-            dport=$(echo "$line" | grep -oP 'dpt:\K[0-9]+')
-            dest=$(echo "$line" | grep -oP 'to:\K[0-9.]+:[0-9]+')
-            dest_ip="${dest%%:*}"
-            dest_port="${dest##*:}"
-            if [[ -n "$proto" && -n "$dport" && -n "$dest_ip" && -n "$dest_port" ]]; then
-                echo "${proto} ${dport} ${dest_ip} ${dest_port}"
-            fi
-        done
+    iptables -t nat -L PREROUTING -n 2>/dev/null | awk '
+        /^\s*DNAT/ {
+            proto = $2
+            dport = ""; dest_ip = ""; dest_port = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^dpt:/)  { split($i, a, ":"); dport = a[2] }
+                if ($i ~ /^to:/)   { split($i, a, ":"); dest_ip = a[2]; dest_port = a[3] }
+            }
+            if (proto != "" && dport != "" && dest_ip != "" && dest_port != "")
+                print proto, dport, dest_ip, dest_port
+        }'
 }
 
 # 读取规则到数组（调用方需声明 -a rules=()）
@@ -169,8 +177,7 @@ show_rules() {
     fi
 
     # 表头
-    printf "  ${BOLD}%-4s  %-6s  %-14s  %-18s  %-10s  %s${NC}\n" \
-           "序号" "协议" "本地端口（入）" "目标地址" "目标端口" "备注"
+    echo -e "  ${BOLD}序号  协议    本地端口（入）  目标地址            目标端口    备注${NC}"
     echo -e "  ${DIM}────  ──────  ──────────────  ──────────────────  ──────────  ────────${NC}"
 
     local idx=0
@@ -224,8 +231,8 @@ add_rule() {
 
     # 目标 IP
     read -rp "  目标 IP 地址: " dest_ip
-    if ! [[ "$dest_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        warn "IP 地址格式无效"; return
+    if ! valid_ip "$dest_ip"; then
+        warn "IP 地址无效（需为合法 IPv4，每段 0-255）"; return
     fi
 
     # 目标端口
@@ -381,8 +388,8 @@ modify_rule() {
     if ! [[ "$new_lport" =~ ^[0-9]+$ ]] || [[ "$new_lport" -lt 1 || "$new_lport" -gt 65535 ]]; then
         warn "本地端口无效"; return
     fi
-    if ! [[ "$new_dip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        warn "目标 IP 格式无效"; return
+    if ! valid_ip "$new_dip"; then
+        warn "目标 IP 无效（需为合法 IPv4，每段 0-255）"; return
     fi
     if ! [[ "$new_dport" =~ ^[0-9]+$ ]] || [[ "$new_dport" -lt 1 || "$new_dport" -gt 65535 ]]; then
         warn "目标端口无效"; return
@@ -405,19 +412,30 @@ modify_rule() {
         -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
         -j MASQUERADE 2>/dev/null || true
-    _ufw_delete_forward "$proto" "$dip" "$dport"
-    _delete_note "$proto" "$lport" "$dip" "$dport"
 
-    # 添加新规则
+    # 添加新规则（失败则回滚旧规则）
     if iptables -t nat -A PREROUTING -p "$proto" --dport "$new_lport" \
            -j DNAT --to-destination "${new_dip}:${new_dport}" && \
        iptables -t nat -A POSTROUTING -p "$proto" -d "$new_dip" --dport "$new_dport" \
            -j MASQUERADE; then
         ok "规则已更新"
+        _ufw_delete_forward "$proto" "$dip" "$dport"
         _ufw_allow_forward "$proto" "$new_dip" "$new_dport"
+        _delete_note "$proto" "$lport" "$dip" "$dport"
         [[ -n "$new_note" ]] && _set_note "$proto" "$new_lport" "$new_dip" "$new_dport" "$new_note"
     else
-        warn "更新失败，请手动检查 iptables 规则"
+        warn "新规则添加失败，正在回滚..."
+        # 清理可能部分添加的新规则
+        iptables -t nat -D PREROUTING -p "$proto" --dport "$new_lport" \
+            -j DNAT --to-destination "${new_dip}:${new_dport}" 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -p "$proto" -d "$new_dip" --dport "$new_dport" \
+            -j MASQUERADE 2>/dev/null || true
+        # 恢复旧规则
+        iptables -t nat -A PREROUTING -p "$proto" --dport "$lport" \
+            -j DNAT --to-destination "${dip}:${dport}" && \
+        iptables -t nat -A POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
+            -j MASQUERADE && \
+            ok "已回滚至原规则" || warn "回滚失败，请手动检查 iptables 规则"
         return
     fi
 
@@ -497,13 +515,12 @@ _install_systemd_restore() {
     cat > "$svc_file" <<EOF
 [Unit]
 Description=Restore iptables NAT rules (port-forward manager)
-Before=network-pre.target
+After=network-pre.target
 Wants=network-pre.target
-DefaultDependencies=no
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/iptables-restore --noflush ${rules_file}
+ExecStart=/sbin/iptables-restore --noflush --table nat ${rules_file}
 RemainAfterExit=yes
 
 [Install]
@@ -520,10 +537,10 @@ save_rules() {
     info "正在保存 iptables 规则..."
 
     mkdir -p /etc/iptables
-    if ! iptables-save > /etc/iptables/rules.v4; then
+    if ! iptables-save -t nat > /etc/iptables/rules.v4; then
         warn "保存失败（iptables-save 出错）"; return
     fi
-    ok "规则已写入 /etc/iptables/rules.v4"
+    ok "NAT 规则已写入 /etc/iptables/rules.v4"
 
     if command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null; then
         _install_systemd_restore
@@ -574,9 +591,9 @@ main_menu() {
 
         case "$choice" in
             1) show_rules; pause ;;
-            2) add_rule ;;
-            3) delete_rule ;;
-            4) modify_rule ;;
+            2) add_rule; pause ;;
+            3) delete_rule; pause ;;
+            4) modify_rule; pause ;;
             5) ip_forward_menu; pause ;;
             0) echo -e "\n  ${GREEN}再见！${NC}\n"; exit 0 ;;
             *) warn "无效选项，请输入 0-5"; sleep 1 ;;
