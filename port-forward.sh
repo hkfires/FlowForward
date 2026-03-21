@@ -62,7 +62,48 @@ check_root() {
 }
 
 # ── 依赖与环境检查 ───────────────────────────────────────────
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
 UFW_ACTIVE=0
+FORWARD_POLICY_DROP=""
+FORWARD_RULE_TAG="flowforward-managed-forward"
+
+_has_forward_target_reference() {
+    local proto="$1" dest_ip="$2" dest_port="$3"
+    get_rules | awk -v p="$proto" -v ip="$dest_ip" -v dp="$dest_port" '
+        $1==p && $3==ip && $4==dp { found=1; exit }
+        END { exit(found ? 0 : 1) }'
+}
+
+_forward_policy_is_drop() {
+    if [[ -z "$FORWARD_POLICY_DROP" ]]; then
+        local policy
+        policy=$(iptables -S FORWARD 2>/dev/null | awk '/^-P FORWARD / {print $3; exit}')
+        [[ "$policy" == "DROP" ]] && FORWARD_POLICY_DROP=1 || FORWARD_POLICY_DROP=0
+    fi
+    [[ "$FORWARD_POLICY_DROP" -eq 1 ]]
+}
+
+_forward_rule_comment() {
+    local direction="$1" proto="$2" dest_ip="$3" dest_port="$4"
+    printf '%s:%s:%s:%s:%s' "$FORWARD_RULE_TAG" "$direction" "$proto" "$dest_ip" "$dest_port"
+}
+
+_build_forward_rule_args() {
+    local direction="$1" proto="$2" dest_ip="$3" dest_port="$4"
+    local -n _args=$5
+    local ctstate endpoint_flag port_flag
+
+    if [[ "$direction" == "ingress" ]]; then
+        endpoint_flag=-d; port_flag=--dport; ctstate="NEW,ESTABLISHED,RELATED"
+    else
+        endpoint_flag=-s; port_flag=--sport; ctstate="ESTABLISHED,RELATED"
+    fi
+
+    _args=(-p "$proto" "$endpoint_flag" "$dest_ip" "$port_flag" "$dest_port"
+           -m conntrack --ctstate "$ctstate"
+           -m comment --comment "$(_forward_rule_comment "$direction" "$proto" "$dest_ip" "$dest_port")"
+           -j ACCEPT)
+}
 
 # UFW 共存策略：
 #   - nat 表（DNAT/MASQUERADE）：UFW 不管，ufw reload 不影响
@@ -73,6 +114,8 @@ _ufw_allow_forward() {
     local proto="$1" dest_ip="$2" dest_port="$3"
     if ufw route allow proto "$proto" to "$dest_ip" port "$dest_port" &>/dev/null; then
         ok "已添加 UFW 放行规则（ufw route）"
+    else
+        return 1
     fi
 }
 
@@ -80,13 +123,141 @@ _ufw_delete_forward() {
     [[ $UFW_ACTIVE -eq 0 ]] && return 0
     local proto="$1" dest_ip="$2" dest_port="$3"
     # 若仍有其他转发规则指向同一目标，保留 UFW 放行规则
-    if get_rules | awk -v p="$proto" -v ip="$dest_ip" -v dp="$dest_port" \
-           '$1==p && $3==ip && $4==dp' | grep -q .; then
+    if _has_forward_target_reference "$proto" "$dest_ip" "$dest_port"; then
         return 0
     fi
     if ufw route delete allow proto "$proto" to "$dest_ip" port "$dest_port" &>/dev/null; then
         ok "已删除 UFW 放行规则（ufw route）"
+        return 0
     fi
+    warn "删除 UFW 放行规则失败，请检查 ufw 配置"
+    return 1
+}
+
+_manual_forward_apply_rule() {
+    local direction="$1" proto="$2" dest_ip="$3" dest_port="$4"
+    local -a rule_args=()
+    _build_forward_rule_args "$direction" "$proto" "$dest_ip" "$dest_port" rule_args
+
+    iptables -C FORWARD "${rule_args[@]}" &>/dev/null && return 0
+    iptables -I FORWARD 1 "${rule_args[@]}" && return 10
+    return 1
+}
+
+_manual_forward_delete_rule() {
+    local direction="$1" proto="$2" dest_ip="$3" dest_port="$4"
+    local -a rule_args=()
+    _build_forward_rule_args "$direction" "$proto" "$dest_ip" "$dest_port" rule_args
+
+    iptables -D FORWARD "${rule_args[@]}" &>/dev/null
+}
+
+_manual_forward_allow() {
+    local proto="$1" dest_ip="$2" dest_port="$3" quiet="${4:-}"
+    _forward_policy_is_drop || return 0
+
+    local changed=0 added_ingress=0 added_egress=0 rc
+
+    _manual_forward_apply_rule ingress "$proto" "$dest_ip" "$dest_port"
+    rc=$?
+    case "$rc" in
+        0) ;;
+        10) changed=1; added_ingress=1 ;;
+        *) warn "FORWARD 放行规则添加失败，请检查 filter/FORWARD 配置"; return 1 ;;
+    esac
+
+    _manual_forward_apply_rule egress "$proto" "$dest_ip" "$dest_port"
+    rc=$?
+    case "$rc" in
+        0) ;;
+        10) changed=1; added_egress=1 ;;
+        *)
+            [[ $added_ingress -eq 1 ]] && _manual_forward_delete_rule ingress "$proto" "$dest_ip" "$dest_port"
+            warn "FORWARD 放行规则添加失败，请检查 filter/FORWARD 配置"
+            return 1
+            ;;
+    esac
+
+    [[ $changed -eq 1 && "$quiet" != "quiet" ]] && ok "已添加 FORWARD 放行规则"
+}
+
+_manual_forward_delete() {
+    local proto="$1" dest_ip="$2" dest_port="$3"
+    # 若仍有其他转发规则指向同一目标，保留 FORWARD 放行规则
+    if _has_forward_target_reference "$proto" "$dest_ip" "$dest_port"; then
+        return 0
+    fi
+
+    local deleted=0
+    if _manual_forward_delete_rule ingress "$proto" "$dest_ip" "$dest_port"; then
+        deleted=1
+    fi
+    if _manual_forward_delete_rule egress "$proto" "$dest_ip" "$dest_port"; then
+        deleted=1
+    fi
+
+    [[ $deleted -eq 1 ]] && ok "已删除 FORWARD 放行规则"
+}
+
+ensure_forward_allow() {
+    local proto="$1" dest_ip="$2" dest_port="$3"
+    if [[ $UFW_ACTIVE -eq 1 ]]; then
+        _ufw_allow_forward "$proto" "$dest_ip" "$dest_port"
+    else
+        _manual_forward_allow "$proto" "$dest_ip" "$dest_port"
+    fi
+}
+
+delete_forward_allow() {
+    local proto="$1" dest_ip="$2" dest_port="$3"
+    if [[ $UFW_ACTIVE -eq 1 ]]; then
+        _ufw_delete_forward "$proto" "$dest_ip" "$dest_port"
+    else
+        _manual_forward_delete "$proto" "$dest_ip" "$dest_port"
+    fi
+}
+
+_add_nat_rules() {
+    local proto="$1" local_port="$2" dest_ip="$3" dest_port="$4"
+    iptables -t nat -A PREROUTING -p "$proto" --dport "$local_port" \
+        -j DNAT --to-destination "${dest_ip}:${dest_port}" && \
+    iptables -t nat -A POSTROUTING -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+        -j MASQUERADE
+}
+
+_remove_nat_rules() {
+    local proto="$1" local_port="$2" dest_ip="$3" dest_port="$4"
+    iptables -t nat -D PREROUTING -p "$proto" --dport "$local_port" \
+        -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -p "$proto" -d "$dest_ip" --dport "$dest_port" \
+        -j MASQUERADE 2>/dev/null || true
+}
+
+_rollback_to_old_rule() {
+    local proto="$1" old_lport="$2" old_dip="$3" old_dport="$4"
+    local new_lport="$5" new_dip="$6" new_dport="$7"
+    _remove_nat_rules "$proto" "$new_lport" "$new_dip" "$new_dport"
+    if _add_nat_rules "$proto" "$old_lport" "$old_dip" "$old_dport" && \
+       ensure_forward_allow "$proto" "$old_dip" "$old_dport"; then
+        ok "已回滚至原规则"
+    else
+        warn "回滚失败，请手动检查 iptables 规则"
+    fi
+}
+
+restore_managed_forward_rules() {
+    command -v iptables &>/dev/null || return 0
+    [[ $UFW_ACTIVE -eq 0 ]] || return 0
+    _forward_policy_is_drop || return 0
+
+    local -a rules=()
+    local rule proto lport dest_ip dest_port
+    load_rules_array rules
+
+    for rule in "${rules[@]}"; do
+        read -r proto lport dest_ip dest_port <<< "$rule"
+        _manual_forward_allow "$proto" "$dest_ip" "$dest_port" quiet || return 1
+    done
 }
 
 # firewalld 专项处理（firewalld 管理 nat 表，冲突不可调和）
@@ -117,6 +288,8 @@ check_deps() {
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "^Status: active"; then
         UFW_ACTIVE=1
         info "检测到 UFW，将自动同步 ufw route 规则以放行转发流量"
+    elif _forward_policy_is_drop; then
+        info "检测到 FORWARD 默认策略为 DROP，将自动同步 FORWARD 放行规则"
     fi
 
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
@@ -127,13 +300,17 @@ check_deps() {
 # ── 规则解析 ─────────────────────────────────────────────────
 # 输出格式（每行）：proto local_port dest_ip dest_port
 get_rules() {
-    iptables -t nat -L PREROUTING -n 2>/dev/null | awk '
-        /^\s*DNAT/ {
-            proto = $2
-            dport = ""; dest_ip = ""; dest_port = ""
+    iptables-save -t nat 2>/dev/null | awk '
+        /^-A PREROUTING / && /-j DNAT/ {
+            proto = dport = dest_ip = dest_port = ""
             for (i = 1; i <= NF; i++) {
-                if ($i ~ /^dpt:/)  { split($i, a, ":"); dport = a[2] }
-                if ($i ~ /^to:/)   { split($i, a, ":"); dest_ip = a[2]; dest_port = a[3] }
+                if ($i == "-p" && i + 1 <= NF) proto = $(i + 1)
+                if ($i == "--dport" && i + 1 <= NF) dport = $(i + 1)
+                if ($i == "--to-destination" && i + 1 <= NF) {
+                    split($(i + 1), a, ":")
+                    dest_ip = a[1]
+                    dest_port = a[2]
+                }
             }
             if (proto != "" && dport != "" && dest_ip != "" && dest_port != "")
                 print proto, dport, dest_ip, dest_port
@@ -258,13 +435,14 @@ add_rule() {
 
     # 执行
     for p in "${protocols[@]}"; do
-        if iptables -t nat -A PREROUTING -p "$p" --dport "$local_port" \
-               -j DNAT --to-destination "${dest_ip}:${dest_port}" && \
-           iptables -t nat -A POSTROUTING -p "$p" -d "$dest_ip" --dport "$dest_port" \
-               -j MASQUERADE; then
-            ok "已添加 ${p^^} 转发规则"
-            _ufw_allow_forward "$p" "$dest_ip" "$dest_port"
-            [[ -n "$note" ]] && _set_note "$p" "$local_port" "$dest_ip" "$dest_port" "$note"
+        if _add_nat_rules "$p" "$local_port" "$dest_ip" "$dest_port"; then
+            if ensure_forward_allow "$p" "$dest_ip" "$dest_port"; then
+                ok "已添加 ${p^^} 转发规则"
+                [[ -n "$note" ]] && _set_note "$p" "$local_port" "$dest_ip" "$dest_port" "$note"
+            else
+                _remove_nat_rules "$p" "$local_port" "$dest_ip" "$dest_port"
+                warn "添加 ${p^^} 规则失败，已回滚"
+            fi
         else
             warn "添加 ${p^^} 规则失败"
         fi
@@ -312,25 +490,39 @@ delete_rule() {
     read -rp "  确认删除？[y/N] " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消"; return; }
 
-    local ok_count=0
+    local dnat_deleted=0 masquerade_deleted=0
     if iptables -t nat -D PREROUTING -p "$proto" --dport "$lport" \
            -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null; then
         ok "已删除 DNAT 规则"
-        ok_count=$((ok_count + 1))
+        dnat_deleted=1
     else
         warn "DNAT 规则删除失败（可能已不存在）"
     fi
     if iptables -t nat -D POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
            -j MASQUERADE 2>/dev/null; then
         ok "已删除 MASQUERADE 规则"
-        ok_count=$((ok_count + 1))
+        masquerade_deleted=1
     else
         warn "MASQUERADE 规则删除失败（可能已不存在）"
     fi
-    _ufw_delete_forward "$proto" "$dip" "$dport"
+
+    if ! delete_forward_allow "$proto" "$dip" "$dport"; then
+        warn "FORWARD 放行规则删除失败，正在回滚 NAT 规则..."
+        if [[ $dnat_deleted -eq 1 ]]; then
+            iptables -t nat -A PREROUTING -p "$proto" --dport "$lport" \
+                -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null || true
+        fi
+        if [[ $masquerade_deleted -eq 1 ]]; then
+            iptables -t nat -A POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
+                -j MASQUERADE 2>/dev/null || true
+        fi
+        warn "已回滚 NAT 规则，请手动检查放行规则状态"
+        return
+    fi
+
     _delete_note "$proto" "$lport" "$dip" "$dport"
 
-    [[ $ok_count -gt 0 ]] && save_rules
+    [[ $dnat_deleted -eq 1 || $masquerade_deleted -eq 1 ]] && save_rules
 }
 
 # ── 4. 修改规则 ───────────────────────────────────────────────
@@ -408,34 +600,28 @@ modify_rule() {
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消"; return; }
 
     # 删除旧规则
-    iptables -t nat -D PREROUTING -p "$proto" --dport "$lport" \
-        -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
-        -j MASQUERADE 2>/dev/null || true
+    _remove_nat_rules "$proto" "$lport" "$dip" "$dport"
 
     # 添加新规则（失败则回滚旧规则）
-    if iptables -t nat -A PREROUTING -p "$proto" --dport "$new_lport" \
-           -j DNAT --to-destination "${new_dip}:${new_dport}" && \
-       iptables -t nat -A POSTROUTING -p "$proto" -d "$new_dip" --dport "$new_dport" \
-           -j MASQUERADE; then
-        ok "规则已更新"
-        _ufw_delete_forward "$proto" "$dip" "$dport"
-        _ufw_allow_forward "$proto" "$new_dip" "$new_dport"
-        _delete_note "$proto" "$lport" "$dip" "$dport"
-        [[ -n "$new_note" ]] && _set_note "$proto" "$new_lport" "$new_dip" "$new_dport" "$new_note"
+    if _add_nat_rules "$proto" "$new_lport" "$new_dip" "$new_dport"; then
+        if ensure_forward_allow "$proto" "$new_dip" "$new_dport"; then
+            if delete_forward_allow "$proto" "$dip" "$dport"; then
+                ok "规则已更新"
+                _delete_note "$proto" "$lport" "$dip" "$dport"
+                [[ -n "$new_note" ]] && _set_note "$proto" "$new_lport" "$new_dip" "$new_dport" "$new_note"
+            else
+                warn "旧 FORWARD 放行规则删除失败，正在回滚..."
+                _rollback_to_old_rule "$proto" "$lport" "$dip" "$dport" "$new_lport" "$new_dip" "$new_dport"
+                return
+            fi
+        else
+            warn "新 FORWARD 放行规则添加失败，正在回滚..."
+            _rollback_to_old_rule "$proto" "$lport" "$dip" "$dport" "$new_lport" "$new_dip" "$new_dport"
+            return
+        fi
     else
-        warn "新规则添加失败，正在回滚..."
-        # 清理可能部分添加的新规则
-        iptables -t nat -D PREROUTING -p "$proto" --dport "$new_lport" \
-            -j DNAT --to-destination "${new_dip}:${new_dport}" 2>/dev/null || true
-        iptables -t nat -D POSTROUTING -p "$proto" -d "$new_dip" --dport "$new_dport" \
-            -j MASQUERADE 2>/dev/null || true
-        # 恢复旧规则
-        iptables -t nat -A PREROUTING -p "$proto" --dport "$lport" \
-            -j DNAT --to-destination "${dip}:${dport}" && \
-        iptables -t nat -A POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
-            -j MASQUERADE && \
-            ok "已回滚至原规则" || warn "回滚失败，请手动检查 iptables 规则"
+        warn "新 NAT 规则添加失败，正在回滚..."
+        _rollback_to_old_rule "$proto" "$lport" "$dip" "$dport" "$new_lport" "$new_dip" "$new_dport"
         return
     fi
 
@@ -502,13 +688,14 @@ ip_forward_menu() {
 }
 
 # ── 6. 保存规则（持久化）────────────────────────────────────
-# 自建 systemd 服务，开机自动恢复 iptables 规则
+# 自建 systemd 服务，开机恢复 NAT 规则后重新同步 FORWARD 放行规则
 _install_systemd_restore() {
-    local rules_file="/etc/iptables/rules.v4"
+    local nat_rules_file="/etc/iptables/rules.v4"
     local svc_file="/etc/systemd/system/iptables-restore-custom.service"
 
-    # 已注册则跳过，只更新规则文件即可
-    if systemctl is-enabled --quiet iptables-restore-custom 2>/dev/null; then
+    # 若服务已启用且配置未变（含当前脚本路径），跳过
+    if systemctl is-enabled --quiet iptables-restore-custom 2>/dev/null && \
+       [[ -f "$svc_file" ]] && grep -qF "$SCRIPT_PATH" "$svc_file" 2>/dev/null; then
         return 0
     fi
 
@@ -520,7 +707,8 @@ Wants=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/iptables-restore --noflush --table nat ${rules_file}
+ExecStart=/sbin/iptables-restore --noflush --table nat ${nat_rules_file}
+ExecStart=/bin/bash ${SCRIPT_PATH} --restore-forward-rules
 RemainAfterExit=yes
 
 [Install]
@@ -548,6 +736,7 @@ save_rules() {
         echo ""
         echo -e "  ${YELLOW}提示：未检测到 systemd，请手动配置开机恢复，例如在 /etc/rc.local 中添加：${NC}"
         echo -e "  ${DIM}iptables-restore < /etc/iptables/rules.v4${NC}"
+        echo -e "  ${DIM}${SCRIPT_PATH} --restore-forward-rules${NC}"
     fi
     echo ""
 }
@@ -602,6 +791,13 @@ main_menu() {
 }
 
 # ── 入口 ─────────────────────────────────────────────────────
+if [[ "${1:-}" == "--restore-forward-rules" ]]; then
+    check_root
+    check_deps
+    restore_managed_forward_rules
+    exit $?
+fi
+
 check_root
 check_deps
 main_menu
