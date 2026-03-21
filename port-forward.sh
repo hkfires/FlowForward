@@ -78,14 +78,13 @@ _forward_policy_is_drop() {
     if [[ -z "$FORWARD_POLICY_DROP" ]]; then
         local policy
         policy=$(iptables -S FORWARD 2>/dev/null | awk '/^-P FORWARD / {print $3; exit}')
-        [[ "$policy" == "DROP" ]] && FORWARD_POLICY_DROP=1 || FORWARD_POLICY_DROP=0
+        if [[ "$policy" == "DROP" ]]; then
+            FORWARD_POLICY_DROP=1
+        else
+            FORWARD_POLICY_DROP=0
+        fi
     fi
     [[ "$FORWARD_POLICY_DROP" -eq 1 ]]
-}
-
-_forward_rule_comment() {
-    local direction="$1" proto="$2" dest_ip="$3" dest_port="$4"
-    printf '%s:%s:%s:%s:%s' "$FORWARD_RULE_TAG" "$direction" "$proto" "$dest_ip" "$dest_port"
 }
 
 _build_forward_rule_args() {
@@ -101,7 +100,7 @@ _build_forward_rule_args() {
 
     _args=(-p "$proto" "$endpoint_flag" "$dest_ip" "$port_flag" "$dest_port"
            -m conntrack --ctstate "$ctstate"
-           -m comment --comment "$(_forward_rule_comment "$direction" "$proto" "$dest_ip" "$dest_port")"
+           -m comment --comment "${FORWARD_RULE_TAG}:${direction}:${proto}:${dest_ip}:${dest_port}"
            -j ACCEPT)
 }
 
@@ -152,11 +151,12 @@ _manual_forward_delete_rule() {
     iptables -D FORWARD "${rule_args[@]}" &>/dev/null
 }
 
+# 返回值：0=已存在/无需操作 10=新增了规则 1=失败
 _manual_forward_allow() {
-    local proto="$1" dest_ip="$2" dest_port="$3" quiet="${4:-}"
+    local proto="$1" dest_ip="$2" dest_port="$3"
     _forward_policy_is_drop || return 0
 
-    local changed=0 added_ingress=0 added_egress=0 rc
+    local changed=0 added_ingress=0 rc
 
     _manual_forward_apply_rule ingress "$proto" "$dest_ip" "$dest_port"
     rc=$?
@@ -170,7 +170,7 @@ _manual_forward_allow() {
     rc=$?
     case "$rc" in
         0) ;;
-        10) changed=1; added_egress=1 ;;
+        10) changed=1 ;;
         *)
             [[ $added_ingress -eq 1 ]] && _manual_forward_delete_rule ingress "$proto" "$dest_ip" "$dest_port"
             warn "FORWARD 放行规则添加失败，请检查 filter/FORWARD 配置"
@@ -178,7 +178,8 @@ _manual_forward_allow() {
             ;;
     esac
 
-    [[ $changed -eq 1 && "$quiet" != "quiet" ]] && ok "已添加 FORWARD 放行规则"
+    [[ $changed -eq 1 ]] && return 10
+    return 0
 }
 
 _manual_forward_delete() {
@@ -205,6 +206,10 @@ ensure_forward_allow() {
         _ufw_allow_forward "$proto" "$dest_ip" "$dest_port"
     else
         _manual_forward_allow "$proto" "$dest_ip" "$dest_port"
+        local rc=$?
+        [[ $rc -eq 10 ]] && ok "已添加 FORWARD 放行规则"
+        [[ $rc -eq 1 ]] && return 1
+        return 0
     fi
 }
 
@@ -256,7 +261,8 @@ restore_managed_forward_rules() {
 
     for rule in "${rules[@]}"; do
         read -r proto lport dest_ip dest_port <<< "$rule"
-        _manual_forward_allow "$proto" "$dest_ip" "$dest_port" quiet || return 1
+        _manual_forward_allow "$proto" "$dest_ip" "$dest_port"
+        [[ $? -eq 1 ]] && return 1
     done
 }
 
@@ -400,7 +406,7 @@ add_rule() {
     fi
 
     # 检查端口是否已有规则
-    if get_rules | awk -v p="$local_port" '$2 == p' | grep -q .; then
+    if get_rules | awk -v p="$local_port" '$2==p { found=1; exit } END { exit(found ? 0 : 1) }'; then
         warn "本地端口 ${local_port} 已有转发规则"
         read -rp "  仍要继续添加？[y/N] " cont
         [[ "$cont" =~ ^[Yy]$ ]] || return
@@ -744,6 +750,9 @@ save_rules() {
 # ── 主菜单 ────────────────────────────────────────────────────
 main_menu() {
     while true; do
+        # 每轮循环重置缓存，确保检测到外部变更
+        FORWARD_POLICY_DROP=""
+
         clear
         echo ""
         echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════╗${NC}"
