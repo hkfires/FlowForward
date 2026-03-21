@@ -63,9 +63,13 @@ check_root() {
 
 # ── 依赖与环境检查 ───────────────────────────────────────────
 SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+VERSION="1.0"
 UFW_ACTIVE=0
 FORWARD_POLICY_DROP=""
 FORWARD_RULE_TAG="flowforward-managed-forward"
+INSTALL_PATH="/usr/local/bin/ff"
+UPDATE_URL="https://raw.githubusercontent.com/hkfires/FlowForward/main/FlowForward.sh"
+SVC_FILE="/etc/systemd/system/iptables-restore-custom.service"
 
 _has_forward_target_reference() {
     local proto="$1" dest_ip="$2" dest_port="$3"
@@ -697,15 +701,14 @@ ip_forward_menu() {
 # 自建 systemd 服务，开机恢复 NAT 规则后重新同步 FORWARD 放行规则
 _install_systemd_restore() {
     local nat_rules_file="/etc/iptables/rules.v4"
-    local svc_file="/etc/systemd/system/iptables-restore-custom.service"
 
     # 若服务已启用且配置未变（含当前脚本路径），跳过
     if systemctl is-enabled --quiet iptables-restore-custom 2>/dev/null && \
-       [[ -f "$svc_file" ]] && grep -qF "$SCRIPT_PATH" "$svc_file" 2>/dev/null; then
+       [[ -f "$SVC_FILE" ]] && grep -qF "$SCRIPT_PATH" "$SVC_FILE" 2>/dev/null; then
         return 0
     fi
 
-    cat > "$svc_file" <<EOF
+    cat > "$SVC_FILE" <<EOF
 [Unit]
 Description=Restore iptables NAT rules (port-forward manager)
 After=network-pre.target
@@ -747,6 +750,221 @@ save_rules() {
     echo ""
 }
 
+# ── 7. 导出规则 ────────────────────────────────────────────────
+export_rules() {
+    echo ""
+    echo -e "${BOLD}${CYAN}  ┌────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${CYAN}  │                      导出转发规则                      │${NC}"
+    echo -e "${BOLD}${CYAN}  └────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+
+    local -a rules=()
+    load_rules_array rules
+
+    if [[ ${#rules[@]} -eq 0 ]]; then
+        info "当前暂无转发规则"
+        return
+    fi
+
+    local default_file
+    default_file="${HOME:-/tmp}/ff-export-$(date +%Y%m%d-%H%M%S).sh"
+    read -rp "  导出文件路径 [${default_file}]: " export_file
+    export_file="${export_file:-$default_file}"
+
+    {
+        printf "#!/usr/bin/env bash\n"
+        printf "# FlowForward 转发规则导出\n"
+        printf "# 导出时间：%s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf "# 规则数量：%d\n\n" "${#rules[@]}"
+
+        printf "# ── iptables NAT 规则 ──\n"
+        local proto lport dip dport note
+        for rule in "${rules[@]}"; do
+            read -r proto lport dip dport <<< "$rule"
+            note=$(_get_note "$proto" "$lport" "$dip" "$dport")
+            [[ -n "$note" ]] && printf "\n# %s\n" "$note" || printf "\n"
+            printf "iptables -t nat -A PREROUTING -p %s -m %s --dport %s -j DNAT --to-destination %s:%s\n" \
+                "$proto" "$proto" "$lport" "$dip" "$dport"
+            printf "iptables -t nat -A POSTROUTING -d %s/32 -p %s -m %s --dport %s -j MASQUERADE\n" \
+                "$dip" "$proto" "$proto" "$dport"
+        done
+
+        if [[ $UFW_ACTIVE -eq 1 ]]; then
+            printf "\n# ── UFW 路由放行规则 ──\n"
+            for rule in "${rules[@]}"; do
+                read -r proto lport dip dport <<< "$rule"
+                printf "ufw route allow proto %s to %s port %s\n" "$proto" "$dip" "$dport"
+            done
+        fi
+
+        printf "\n"
+    } | tee "$export_file"
+
+    chmod +x "$export_file"
+    echo ""
+    ok "规则已导出至 $export_file"
+}
+
+# ── 8. 更新脚本 ────────────────────────────────────────────────
+update_script() {
+    echo ""
+    echo -e "${BOLD}${CYAN}  ┌────────────────────────────┐${NC}"
+    echo -e "${BOLD}${CYAN}  │         更新脚本           │${NC}"
+    echo -e "${BOLD}${CYAN}  └────────────────────────────┘${NC}"
+    echo ""
+
+    local dl_cmd=""
+    if command -v curl &>/dev/null; then
+        dl_cmd="curl"
+    elif command -v wget &>/dev/null; then
+        dl_cmd="wget"
+    else
+        die "未找到 curl 或 wget，无法检查更新"
+    fi
+
+    info "正在检查更新..."
+    local tmp_file
+    tmp_file=$(mktemp /tmp/ff-update.XXXXXX)
+
+    local dl_ok=0
+    if [[ "$dl_cmd" == "curl" ]]; then
+        curl -fsSL --connect-timeout 10 --max-time 30 "$UPDATE_URL" -o "$tmp_file" 2>/dev/null && dl_ok=1
+    else
+        wget -qO "$tmp_file" --timeout=30 "$UPDATE_URL" 2>/dev/null && dl_ok=1
+    fi
+
+    if [[ $dl_ok -eq 0 || ! -s "$tmp_file" ]]; then
+        rm -f "$tmp_file"
+        warn "获取远程版本失败，请检查网络连接"
+        return
+    fi
+
+    local remote_ver
+    remote_ver=$(grep -m1 '^VERSION=' "$tmp_file" 2>/dev/null | cut -d'"' -f2)
+    if [[ -z "$remote_ver" ]]; then
+        rm -f "$tmp_file"
+        warn "无法从远程文件中读取版本号"
+        return
+    fi
+
+    echo -e "  本地版本：${BOLD}v${VERSION}${NC}"
+    echo -e "  远程版本：${BOLD}v${remote_ver}${NC}"
+    echo ""
+
+    # 版本比较：取两者中较大值
+    local latest
+    latest=$(printf '%s\n' "$VERSION" "$remote_ver" | sort -V | tail -1)
+
+    if [[ "$VERSION" == "$remote_ver" ]]; then
+        rm -f "$tmp_file"
+        ok "当前已是最新版本（v${VERSION}）"
+        return
+    fi
+
+    if [[ "$latest" == "$VERSION" ]]; then
+        rm -f "$tmp_file"
+        ok "当前版本（v${VERSION}）比远程版本（v${remote_ver}）更新，无需升级"
+        return
+    fi
+
+    read -rp "  发现新版本 v${remote_ver}，确认更新？[y/N] " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        rm -f "$tmp_file"
+        info "已取消"
+        return
+    fi
+
+    mv -f "$tmp_file" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+    ok "已更新至 v${remote_ver}（$INSTALL_PATH）"
+    echo ""
+    info "请重新运行：ff"
+    exit 0
+}
+
+# ── 10. 卸载脚本 ───────────────────────────────────────────────
+uninstall_script() {
+    echo ""
+    echo -e "${BOLD}${CYAN}  ┌────────────────────────────┐${NC}"
+    echo -e "${BOLD}${CYAN}  │         卸载脚本           │${NC}"
+    echo -e "${BOLD}${CYAN}  └────────────────────────────┘${NC}"
+    echo ""
+
+    if [[ ! -f "$INSTALL_PATH" ]]; then
+        warn "未在 $INSTALL_PATH 找到已安装的脚本，无需卸载"
+        return
+    fi
+
+    local -a rules=()
+    load_rules_array rules
+    local rule_choice=1
+
+    if [[ ${#rules[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}检测到当前存在 ${#rules[@]} 条转发规则：${NC}"
+        echo ""
+        show_rules
+        echo ""
+        echo -e "  ${BOLD}卸载后，systemd 开机恢复服务将被移除，规则重启后不再自动恢复。${NC}"
+        echo ""
+        echo "  请选择对现有转发规则的处理方式："
+        echo "  1. 保留规则（规则在本次开机内继续生效，重启后消失）"
+        echo "  2. 立即清除所有转发规则"
+        echo "  0. 取消卸载"
+        echo ""
+        read -rp "  请选择 [0-2]: " rule_choice
+        case "$rule_choice" in
+            0) info "已取消"; return ;;
+            1|2) ;;
+            *) warn "无效选项，已取消"; return ;;
+        esac
+    else
+        read -rp "  确认卸载脚本？[y/N] " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消"; return; }
+    fi
+
+    # 清除转发规则
+    if [[ "$rule_choice" == "2" ]]; then
+        info "正在清除所有转发规则..."
+        local proto lport dip dport
+        for rule in "${rules[@]}"; do
+            read -r proto lport dip dport <<< "$rule"
+            _remove_nat_rules "$proto" "$lport" "$dip" "$dport"
+            delete_forward_allow "$proto" "$dip" "$dport"
+            _delete_note "$proto" "$lport" "$dip" "$dport"
+        done
+        local nat_rules_file="/etc/iptables/rules.v4"
+        [[ -f "$nat_rules_file" ]] && rm -f "$nat_rules_file" && ok "已删除 $nat_rules_file"
+        ok "所有转发规则已清除"
+    fi
+
+    # 停用并删除 systemd 服务
+    systemctl disable --quiet iptables-restore-custom 2>/dev/null || true
+    if [[ -f "$SVC_FILE" ]]; then
+        rm -f "$SVC_FILE"
+        systemctl daemon-reload &>/dev/null
+        ok "已移除 systemd 服务（iptables-restore-custom）"
+    fi
+
+    # 询问是否删除备注文件
+    if [[ -f "$NOTES_FILE" ]]; then
+        echo ""
+        read -rp "  是否同时删除备注文件 ($NOTES_FILE)？[y/N] " del_notes
+        [[ "$del_notes" =~ ^[Yy]$ ]] && rm -f "$NOTES_FILE" && ok "已删除备注文件"
+    fi
+
+    # 删除已安装的脚本
+    rm -f "$INSTALL_PATH"
+    ok "已删除 $INSTALL_PATH"
+
+    echo ""
+    ok "卸载完成"
+    if [[ "$rule_choice" == "1" && ${#rules[@]} -gt 0 ]]; then
+        warn "注意：现有转发规则仍在内存中生效，重启后将消失"
+    fi
+    echo ""
+    exit 0
+}
+
 # ── 主菜单 ────────────────────────────────────────────────────
 main_menu() {
     while true; do
@@ -778,34 +996,78 @@ main_menu() {
         echo "  2  添加转发规则"
         echo "  3  删除转发规则"
         echo "  4  修改转发规则"
+        echo "  5  导出转发规则"
         echo ""
         echo -e "  ${BOLD}系统设置${NC}"
         echo "  ────────────────────────────────────"
-        echo "  5  IP 转发开关"
+        echo "  6  IP 转发开关"
+        echo ""
+        echo -e "  ${BOLD}工具管理${NC}"
+        echo "  ────────────────────────────────────"
+        echo "  7  更新脚本"
+        echo "  8  卸载脚本"
         echo ""
         echo "  0  退出"
         echo ""
-        read -rp "  请选择操作 [0-5]: " choice
+        read -rp "  请选择操作 [0-8]: " choice
 
         case "$choice" in
             1) show_rules; pause ;;
             2) add_rule; pause ;;
             3) delete_rule; pause ;;
             4) modify_rule; pause ;;
-            5) ip_forward_menu; pause ;;
+            5) export_rules; pause ;;
+            6) ip_forward_menu; pause ;;
+            7) update_script; pause ;;
+            8) uninstall_script ;;
             0) echo -e "\n  ${GREEN}再见！${NC}\n"; exit 0 ;;
-            *) warn "无效选项，请输入 0-5"; sleep 1 ;;
+            *) warn "无效选项，请输入 0-8"; sleep 1 ;;
         esac
     done
 }
 
 # ── 入口 ─────────────────────────────────────────────────────
-if [[ "${1:-}" == "--restore-forward-rules" ]]; then
-    check_root
-    check_deps
-    restore_managed_forward_rules
-    exit $?
-fi
+case "${1:-}" in
+    --restore-forward-rules)
+        check_root
+        check_deps
+        restore_managed_forward_rules
+        exit $?
+        ;;
+    --install)
+        check_root
+        echo ""
+        info "正在安装 FlowForward..."
+        local_dl_cmd=""
+        if command -v curl &>/dev/null; then
+            local_dl_cmd="curl"
+        elif command -v wget &>/dev/null; then
+            local_dl_cmd="wget"
+        else
+            die "未找到 curl 或 wget"
+        fi
+        dl_ok=0
+        if [[ "$local_dl_cmd" == "curl" ]]; then
+            curl -fsSL --connect-timeout 10 --max-time 30 "$UPDATE_URL" -o "$INSTALL_PATH" 2>/dev/null && dl_ok=1
+        else
+            wget -qO "$INSTALL_PATH" --timeout=30 "$UPDATE_URL" 2>/dev/null && dl_ok=1
+        fi
+        if [[ $dl_ok -eq 0 || ! -s "$INSTALL_PATH" ]]; then
+            rm -f "$INSTALL_PATH"
+            die "下载失败，请检查网络连接后重试"
+        fi
+        chmod +x "$INSTALL_PATH"
+        ok "已安装至 $INSTALL_PATH"
+        info "运行命令：ff"
+        echo ""
+        exit 0
+        ;;
+    --uninstall)
+        check_root
+        check_deps
+        uninstall_script
+        ;;
+esac
 
 check_root
 check_deps
