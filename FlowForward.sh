@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-#  端口转发管理工具 v1.0
-#  基于 iptables NAT (DNAT + MASQUERADE)
-#  用途：管理服务器端口到远程目标的 TCP/UDP 流量转发
+#  端口转发管理工具 v1.1
+#  基于 iptables NAT (DNAT + MASQUERADE + statistic)
+#  用途：管理服务器端口到远程目标的 TCP/UDP 流量转发（支持负载均衡）
 # ============================================================
 
 # ── 颜色 ────────────────────────────────────────────────────
@@ -35,16 +35,23 @@ valid_ip() {
 # ── 备注管理 ─────────────────────────────────────────────────
 NOTES_FILE="/etc/iptables/forward-notes.conf"
 
+# 备注 key 格式：proto:lport（规则组级别）
 _get_note() {
-    local key="$1:$2:$3:$4"  # proto:lport:dip:dport
+    local key="$1:$2"  # proto:lport
     [[ -f "$NOTES_FILE" ]] || return 0
-    awk -F'|' -v k="$key" '$1==k {sub(/^[^|]*\|/,""); print; exit}' "$NOTES_FILE"
+    # 先尝试新 key，再尝试旧 key（兼容旧版 proto:lport:dip:dport）
+    local result
+    result=$(awk -F'|' -v k="$key" '$1==k {sub(/^[^|]*\|/,""); print; exit}' "$NOTES_FILE")
+    if [[ -z "$result" && -n "${3:-}" && -n "${4:-}" ]]; then
+        local old_key="$1:$2:$3:$4"
+        result=$(awk -F'|' -v k="$old_key" '$1==k {sub(/^[^|]*\|/,""); print; exit}' "$NOTES_FILE")
+    fi
+    [[ -n "$result" ]] && echo "$result"
 }
 
 _set_note() {
-    local key="$1:$2:$3:$4" note="$5"
+    local key="$1:$2" note="$3"  # proto:lport:note
     mkdir -p "$(dirname "$NOTES_FILE")"
-    # 先移除同 key 旧条目
     if [[ -f "$NOTES_FILE" ]]; then
         awk -F'|' -v k="$key" '$1!=k' "$NOTES_FILE" > "${NOTES_FILE}.tmp"
         mv "${NOTES_FILE}.tmp" "$NOTES_FILE"
@@ -53,7 +60,18 @@ _set_note() {
 }
 
 _delete_note() {
-    _set_note "$1" "$2" "$3" "$4" ""
+    local proto="$1" lport="$2" bip="${3:-}" bport="${4:-}"
+    local key="${proto}:${lport}"
+    local old_key=""
+    [[ -n "$bip" && -n "$bport" ]] && old_key="${proto}:${lport}:${bip}:${bport}"
+
+    mkdir -p "$(dirname "$NOTES_FILE")"
+    if [[ -f "$NOTES_FILE" ]]; then
+        awk -F'|' -v k="$key" -v ok="$old_key" '
+            $1 != k && (ok == "" || $1 != ok)
+        ' "$NOTES_FILE" > "${NOTES_FILE}.tmp"
+        mv "${NOTES_FILE}.tmp" "$NOTES_FILE"
+    fi
 }
 
 # ── 权限检查 ─────────────────────────────────────────────────
@@ -63,7 +81,7 @@ check_root() {
 
 # ── 依赖与环境检查 ───────────────────────────────────────────
 SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
-VERSION="1.0"
+VERSION="1.1"
 UFW_ACTIVE=0
 FORWARD_POLICY_DROP=""
 FORWARD_RULE_TAG="flowforward-managed-forward"
@@ -229,9 +247,15 @@ delete_forward_allow() {
 _add_nat_rules() {
     local proto="$1" local_port="$2" dest_ip="$3" dest_port="$4"
     iptables -t nat -A PREROUTING -p "$proto" --dport "$local_port" \
-        -j DNAT --to-destination "${dest_ip}:${dest_port}" && \
-    iptables -t nat -A POSTROUTING -p "$proto" -d "$dest_ip" --dport "$dest_port" \
-        -j MASQUERADE
+        -j DNAT --to-destination "${dest_ip}:${dest_port}" || return 1
+
+    if ! iptables -t nat -C POSTROUTING -p "$proto" -d "$dest_ip" --dport "$dest_port" -m comment --comment "ff-masq" -j MASQUERADE 2>/dev/null; then
+        if ! iptables -t nat -A POSTROUTING -p "$proto" -d "$dest_ip" --dport "$dest_port" -m comment --comment "ff-masq" -j MASQUERADE; then
+            iptables -t nat -D PREROUTING -p "$proto" --dport "$local_port" -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null
+            return 1
+        fi
+    fi
+    return 0
 }
 
 _remove_nat_rules() {
@@ -239,7 +263,163 @@ _remove_nat_rules() {
     iptables -t nat -D PREROUTING -p "$proto" --dport "$local_port" \
         -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -p "$proto" -d "$dest_ip" --dport "$dest_port" \
-        -j MASQUERADE 2>/dev/null || true
+        -m comment --comment "ff-masq" -j MASQUERADE 2>/dev/null || true
+}
+
+# ── 负载均衡 NAT 规则 ────────────────────────────────────────
+# 添加负载均衡 DNAT 规则（支持多后端，使用 statistic 模块）
+# 用法: _add_nat_rules_lb proto local_port mode backend1_ip:backend1_port [backend2_ip:backend2_port ...]
+_add_nat_rules_lb() {
+    local proto="$1" local_port="$2" mode="$3"
+    shift 3
+    local -a backends=("$@")
+    local n=${#backends[@]}
+
+    if [[ $n -eq 0 ]]; then
+        warn "至少需要 1 个后端"; return 1
+    fi
+
+    # 单后端走简单 DNAT（无需 statistic）
+    if [[ $n -eq 1 ]]; then
+        local ip port
+        IFS=: read -r ip port <<< "${backends[0]}"
+        _add_nat_rules "$proto" "$local_port" "$ip" "$port"
+        return $?
+    fi
+
+    # 多后端：使用 statistic 模块
+    local i
+    for ((i = 0; i < n; i++)); do
+        local ip port
+        IFS=: read -r ip port <<< "${backends[$i]}"
+        local remaining=$((n - i))
+
+        if [[ $remaining -gt 1 ]]; then
+            if [[ "$mode" == "nth" ]]; then
+                iptables -t nat -A PREROUTING -p "$proto" --dport "$local_port" \
+                    -m statistic --mode nth --every "$remaining" --packet 0 \
+                    -j DNAT --to-destination "${ip}:${port}" || { _remove_specific_nat_rules_lb "$proto" "$local_port" "$mode" "${backends[@]}"; return 1; }
+            else
+                local prob
+                prob=$(awk "BEGIN {printf \"%.8f\", 1.0/$remaining}")
+                iptables -t nat -A PREROUTING -p "$proto" --dport "$local_port" \
+                    -m statistic --mode random --probability "$prob" \
+                    -j DNAT --to-destination "${ip}:${port}" || { _remove_specific_nat_rules_lb "$proto" "$local_port" "$mode" "${backends[@]}"; return 1; }
+            fi
+        else
+            # 最后一个后端不需要 statistic
+            iptables -t nat -A PREROUTING -p "$proto" --dport "$local_port" \
+                -j DNAT --to-destination "${ip}:${port}" || { _remove_specific_nat_rules_lb "$proto" "$local_port" "$mode" "${backends[@]}"; return 1; }
+        fi
+
+        # 每个后端都需要 MASQUERADE（先检查是否已存在）
+        if ! iptables -t nat -C POSTROUTING -p "$proto" -d "$ip" --dport "$port" \
+               -m comment --comment "ff-masq" -j MASQUERADE 2>/dev/null; then
+            iptables -t nat -A POSTROUTING -p "$proto" -d "$ip" --dport "$port" \
+                -m comment --comment "ff-masq" -j MASQUERADE || { _remove_specific_nat_rules_lb "$proto" "$local_port" "$mode" "${backends[@]}"; return 1; }
+        fi
+    done
+}
+
+# 专门用于回滚新增的负载均衡 DNAT 规则，而不影响原有的同端口其他规则
+_remove_specific_nat_rules_lb() {
+    local proto="$1" local_port="$2" mode="$3"
+    shift 3
+    local -a backends=("$@")
+    local n=${#backends[@]}
+
+    if [[ $n -eq 0 ]]; then return 0; fi
+
+    if [[ $n -eq 1 ]]; then
+        local ip port
+        IFS=: read -r ip port <<< "${backends[0]}"
+        iptables -t nat -D PREROUTING -p "$proto" --dport "$local_port" \
+            -j DNAT --to-destination "${ip}:${port}" 2>/dev/null || true
+    else
+        local i
+        for ((i = 0; i < n; i++)); do
+            local ip port
+            IFS=: read -r ip port <<< "${backends[$i]}"
+            local remaining=$((n - i))
+
+            if [[ $remaining -gt 1 ]]; then
+                if [[ "$mode" == "nth" ]]; then
+                    iptables -t nat -D PREROUTING -p "$proto" --dport "$local_port" \
+                        -m statistic --mode nth --every "$remaining" --packet 0 \
+                        -j DNAT --to-destination "${ip}:${port}" 2>/dev/null || true
+                else
+                    local prob
+                    prob=$(awk "BEGIN {printf \"%.8f\", 1.0/$remaining}")
+                    iptables -t nat -D PREROUTING -p "$proto" --dport "$local_port" \
+                        -m statistic --mode random --probability "$prob" \
+                        -j DNAT --to-destination "${ip}:${port}" 2>/dev/null || true
+                fi
+            else
+                iptables -t nat -D PREROUTING -p "$proto" --dport "$local_port" \
+                    -j DNAT --to-destination "${ip}:${port}" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # 清理不再被任何规则引用的 MASQUERADE
+    local b
+    for b in "${backends[@]}"; do
+        local ip port
+        IFS=: read -r ip port <<< "$b"
+        if ! get_rules | awk -v p="$proto" -v ip="$ip" -v dp="$port" \
+            '$1==p && $3==ip && $4==dp { found=1; exit } END { exit(found ? 0 : 1) }'; then
+            iptables -t nat -D POSTROUTING -p "$proto" -d "$ip" --dport "$port" \
+                -m comment --comment "ff-masq" -j MASQUERADE 2>/dev/null || true
+        fi
+    done
+}
+
+# 删除指定协议+本地端口的所有 DNAT 及相关 MASQUERADE 规则
+_remove_all_nat_rules_for_port() {
+    local proto="$1" local_port="$2"
+
+    # 收集该端口的所有后端
+    local -a targets=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && targets+=("$line")
+    done < <(get_rules | awk -v p="$proto" -v lp="$local_port" '$1==p && $2==lp {print $3":"$4}')
+
+    # 逐条删除 PREROUTING 中匹配该端口的 DNAT 规则（可能带 statistic）
+    # 使用 iptables-save 精确获取规则然后逐条删除
+    while IFS= read -r rule_line; do
+        [[ -z "$rule_line" ]] && continue
+        # 将 -A 改为 -D 来删除
+        local del_rule
+        del_rule=$(echo "$rule_line" | sed 's/^-A /-D /')
+        echo "$del_rule" | xargs iptables -t nat 2>/dev/null || true
+    done < <(iptables-save -t nat 2>/dev/null | grep "^-A PREROUTING" | grep -E "\-p $proto" | grep "\-\-dport $local_port " | grep "\-j DNAT")
+
+    # 删除对应的 MASQUERADE 规则
+    local target
+    for target in "${targets[@]}"; do
+        local ip port
+        IFS=: read -r ip port <<< "$target"
+        # 仅在没有其他规则引用该后端时删除 MASQUERADE
+        if ! get_rules | awk -v p="$proto" -v ip="$ip" -v dp="$port" -v lp="$local_port" \
+            '$1==p && $3==ip && $4==dp && $2!=lp { found=1; exit } END { exit(found ? 0 : 1) }'; then
+            iptables -t nat -D POSTROUTING -p "$proto" -d "$ip" --dport "$port" \
+                -m comment --comment "ff-masq" -j MASQUERADE 2>/dev/null || true
+        fi
+    done
+}
+
+# 检测规则组的负载均衡模式（返回 nth / random / single）
+_detect_lb_mode() {
+    local proto="$1" local_port="$2"
+    local mode
+    mode=$(iptables-save -t nat 2>/dev/null | grep "^-A PREROUTING" | \
+        grep -E "\-p $proto" | grep "\-\-dport $local_port " | grep "\-j DNAT" | \
+        head -1 | grep -oP '\-\-mode \K(nth|random)' || true)
+    if [[ -z "$mode" ]]; then
+        echo "single"
+    else
+        echo "$mode"
+    fi
 }
 
 _rollback_to_old_rule() {
@@ -336,6 +516,34 @@ load_rules_array() {
     done < <(get_rules)
 }
 
+# ── 规则分组 ─────────────────────────────────────────────────
+# 将 get_rules 的原始行按 (proto, local_port) 分组
+# 输出格式（每行）：proto local_port ip1:port1[,ip2:port2,...]
+get_rule_groups() {
+    get_rules | awk '{
+        key = $1 " " $2
+        if (key in groups)
+            groups[key] = groups[key] "," $3 ":" $4
+        else {
+            groups[key] = $3 ":" $4
+            order[++n] = key
+        }
+    }
+    END {
+        for (i = 1; i <= n; i++)
+            print order[i], groups[order[i]]
+    }'
+}
+
+# 读取规则组到数组
+load_rule_groups_array() {
+    local -n _arr=$1
+    _arr=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && _arr+=("$line")
+    done < <(get_rule_groups)
+}
+
 # ── 1. 查看规则 ───────────────────────────────────────────────
 show_rules() {
     echo ""
@@ -354,27 +562,65 @@ show_rules() {
     fi
     echo ""
 
-    local -a rules=()
-    load_rules_array rules
+    local -a groups=()
+    load_rule_groups_array groups
 
-    if [[ ${#rules[@]} -eq 0 ]]; then
+    if [[ ${#groups[@]} -eq 0 ]]; then
         echo -e "  ${DIM}（暂无转发规则）${NC}"
         echo ""
         return
     fi
 
-    # 表头
-    echo -e "  ${BOLD}序号  协议    本地端口（入）  目标地址            目标端口    备注${NC}"
-    echo -e "  ${DIM}────  ──────  ──────────────  ──────────────────  ──────────  ────────${NC}"
+    # 表头（使用 echo 手动对齐，避免 printf 对中文宽字符计算错误）
+    # 模式列：所有值均为 2 中文字符（直连/轮询/随机），显示占 4 列
+    # 由于 bash printf 对 CJK 字符按字节计宽导致 %-Ns 失效，模式列改用 %s + 手动空格
+    echo -e "  ${BOLD}序号  协议    本地端口（入）  目标地址                      模式    备注${NC}"
+    echo -e "  ${DIM}────  ──────  ──────────────  ────────────────────────────  ──────  ────────${NC}"
 
     local idx=0
-    for rule in "${rules[@]}"; do
+    for group in "${groups[@]}"; do
         idx=$((idx + 1))
-        local proto lport dip dport note
-        read -r proto lport dip dport <<< "$rule"
-        note=$(_get_note "$proto" "$lport" "$dip" "$dport")
-        printf "  %-4s  %-6s  %-14s  %-18s  %-10s  ${DIM}%s${NC}\n" \
-               "${idx}." "${proto^^}" "${lport}" "${dip}" "${dport}" "${note}"
+        local proto lport backends_str
+        read -r proto lport backends_str <<< "$group"
+
+        # 解析后端列表
+        IFS=',' read -ra backends <<< "$backends_str"
+        local n=${#backends[@]}
+
+        # 获取备注（传入首个后端信息以兼容 v1 旧 key）
+        local first_bip first_bport
+        IFS=: read -r first_bip first_bport <<< "${backends[0]}"
+        local note
+        note=$(_get_note "$proto" "$lport" "$first_bip" "$first_bport")
+
+        if [[ $n -eq 1 ]]; then
+            # 单后端
+            printf "  %-4s  %-6s  %-14s  %-28s  %s    ${DIM}%s${NC}\n" \
+                   "${idx}." "${proto^^}" "${lport}" "${backends[0]}" "直连" "${note}"
+        else
+            # 多后端（负载均衡）
+            local mode
+            mode=$(_detect_lb_mode "$proto" "$lport")
+            local mode_label
+            [[ "$mode" == "nth" ]] && mode_label="轮询" || mode_label="随机"
+            local pct
+            pct=$((100 / n))
+            local pct_last
+            pct_last=$((100 - pct * (n - 1)))
+
+            # 第一行
+            printf "  %-4s  %-6s  %-14s  %-28s  %s    ${DIM}%s${NC}\n" \
+                   "${idx}." "${proto^^}" "${lport}" "${backends[0]} (${pct}%)" "${mode_label}" "${note}"
+
+            # 后续行：只显示后端地址
+            local j
+            for ((j = 1; j < n; j++)); do
+                local this_pct=$pct
+                [[ $j -eq $((n - 1)) ]] && this_pct=$pct_last
+                printf "  %-4s  %-6s  %-14s  %-28s\n" \
+                       "" "" "" "${backends[$j]} (${this_pct}%)"
+            done
+        fi
     done
     echo ""
 }
@@ -393,18 +639,20 @@ add_rule() {
     echo "    2) UDP"
     echo "    3) TCP + UDP（同时添加）"
     echo ""
-    read -rp "  请选择 [1-3]: " proto_choice
+    read -rp "  请选择 [1-3, q 取消]: " proto_choice
     local -a protocols=()
     case "$proto_choice" in
         1) protocols=("tcp") ;;
         2) protocols=("udp") ;;
         3) protocols=("tcp" "udp") ;;
+        q|Q) info "已取消"; return ;;
         *) warn "无效选择，已取消"; return ;;
     esac
 
     # 本地端口
     echo ""
-    read -rp "  本地监听端口（建议 10000-60000）: " local_port
+    read -rp "  本地监听端口（建议 10000-60000，q 取消）: " local_port
+    [[ "$local_port" == "q" || "$local_port" == "Q" ]] && { info "已取消"; return; }
     if ! [[ "$local_port" =~ ^[0-9]+$ ]] || [[ "$local_port" -lt 1 || "$local_port" -gt 65535 ]]; then
         warn "端口号无效（范围 1-65535）"; return
     fi
@@ -416,28 +664,82 @@ add_rule() {
         [[ "$cont" =~ ^[Yy]$ ]] || return
     fi
 
-    # 目标 IP
-    read -rp "  目标 IP 地址: " dest_ip
-    if ! valid_ip "$dest_ip"; then
-        warn "IP 地址无效（需为合法 IPv4，每段 0-255）"; return
+    # 收集后端节点（支持多个）
+    echo ""
+    echo -e "  ${BOLD}添加后端节点${NC}（至少 1 个，输入 q 取消，空行结束）："
+    local -a backends=()
+    local bidx=0
+    while true; do
+        bidx=$((bidx + 1))
+        echo ""
+        read -rp "  后端 ${bidx} - IP 地址（回车结束，q 取消）: " dest_ip
+        [[ -z "$dest_ip" ]] && break
+        [[ "$dest_ip" == "q" || "$dest_ip" == "Q" ]] && { info "已取消"; return; }
+
+        if ! valid_ip "$dest_ip"; then
+            warn "IP 地址无效（需为合法 IPv4，每段 0-255）"
+            bidx=$((bidx - 1))
+            continue
+        fi
+
+        read -rp "  后端 ${bidx} - 目标端口（q 取消）: " dest_port
+        [[ "$dest_port" == "q" || "$dest_port" == "Q" ]] && { info "已取消"; return; }
+        if ! [[ "$dest_port" =~ ^[0-9]+$ ]] || [[ "$dest_port" -lt 1 || "$dest_port" -gt 65535 ]]; then
+            warn "端口号无效（范围 1-65535）"
+            bidx=$((bidx - 1))
+            continue
+        fi
+
+        backends+=("${dest_ip}:${dest_port}")
+        echo -e "  ${GREEN}✔${NC} 后端 ${bidx}: ${dest_ip}:${dest_port}"
+    done
+
+    if [[ ${#backends[@]} -eq 0 ]]; then
+        warn "未添加任何后端，已取消"; return
     fi
 
-    # 目标端口
-    read -rp "  目标端口: " dest_port
-    if ! [[ "$dest_port" =~ ^[0-9]+$ ]] || [[ "$dest_port" -lt 1 || "$dest_port" -gt 65535 ]]; then
-        warn "端口号无效（范围 1-65535）"; return
+    # 负载均衡模式（多后端时询问）
+    local lb_mode="nth"
+    if [[ ${#backends[@]} -gt 1 ]]; then
+        echo ""
+        echo -e "  ${BOLD}负载均衡模式：${NC}"
+        echo "    1) 轮询 (nth)    ← 推荐，均匀分配"
+        echo "    2) 随机 (random)"
+        echo ""
+        read -rp "  请选择 [1-2，默认 1]: " mode_choice
+        case "$mode_choice" in
+            2) lb_mode="random" ;;
+            *) lb_mode="nth" ;;
+        esac
     fi
 
     # 备注（可选）
+    echo ""
     read -rp "  备注（可选，直接回车跳过）: " note
 
     # 预览确认
     echo ""
     echo -e "  ${BOLD}即将添加：${NC}"
     for p in "${protocols[@]}"; do
-        local preview="    ${CYAN}${p^^}${NC}  本地:${BOLD}${local_port}${NC}  →  ${dest_ip}:${BOLD}${dest_port}${NC}"
-        [[ -n "$note" ]] && preview+="  ${DIM}(${note})${NC}"
-        echo -e "$preview"
+        local n=${#backends[@]}
+        if [[ $n -eq 1 ]]; then
+            local preview="    ${CYAN}${p^^}${NC}  本地:${BOLD}${local_port}${NC}  →  ${backends[0]}"
+            [[ -n "$note" ]] && preview+="  ${DIM}(${note})${NC}"
+            echo -e "$preview"
+        else
+            local mode_label
+            [[ "$lb_mode" == "nth" ]] && mode_label="轮询" || mode_label="随机"
+            echo -e "    ${CYAN}${p^^}${NC}  本地:${BOLD}${local_port}${NC}  →  ${BOLD}${n} 个后端${NC}  模式:${GREEN}${mode_label}${NC}"
+            local pct=$((100 / n))
+            local pct_last=$((100 - pct * (n - 1)))
+            local bi
+            for ((bi = 0; bi < n; bi++)); do
+                local this_pct=$pct
+                [[ $bi -eq $((n - 1)) ]] && this_pct=$pct_last
+                echo -e "      ${DIM}├─${NC} ${backends[$bi]} (${this_pct}%)"
+            done
+            [[ -n "$note" ]] && echo -e "      ${DIM}备注: ${note}${NC}"
+        fi
     done
     echo ""
     read -rp "  确认添加？[y/N] " confirm
@@ -445,13 +747,31 @@ add_rule() {
 
     # 执行
     for p in "${protocols[@]}"; do
-        if _add_nat_rules "$p" "$local_port" "$dest_ip" "$dest_port"; then
-            if ensure_forward_allow "$p" "$dest_ip" "$dest_port"; then
-                ok "已添加 ${p^^} 转发规则"
-                [[ -n "$note" ]] && _set_note "$p" "$local_port" "$dest_ip" "$dest_port" "$note"
+        if _add_nat_rules_lb "$p" "$local_port" "$lb_mode" "${backends[@]}"; then
+            # 为每个后端添加 FORWARD 放行
+            local all_forward_ok=1
+            for backend in "${backends[@]}"; do
+                local bip bport
+                IFS=: read -r bip bport <<< "$backend"
+                if ! ensure_forward_allow "$p" "$bip" "$bport"; then
+                    all_forward_ok=0
+                    break
+                fi
+            done
+
+            if [[ $all_forward_ok -eq 1 ]]; then
+                ok "已添加 ${p^^} 转发规则（${#backends[@]} 个后端）"
+                [[ -n "$note" ]] && _set_note "$p" "$local_port" "$note"
             else
-                _remove_nat_rules "$p" "$local_port" "$dest_ip" "$dest_port"
-                warn "添加 ${p^^} 规则失败，已回滚"
+                _remove_specific_nat_rules_lb "$p" "$local_port" "$lb_mode" "${backends[@]}"
+                # 清理已成功添加的 FORWARD 放行规则
+                for done_backend in "${backends[@]}"; do
+                    local dbip dbport
+                    IFS=: read -r dbip dbport <<< "$done_backend"
+                    [[ "$dbip:$dbport" == "$bip:$bport" ]] && break
+                    delete_forward_allow "$p" "$dbip" "$dbport"
+                done
+                warn "添加 ${p^^} FORWARD 放行规则失败，已回滚"
             fi
         else
             warn "添加 ${p^^} 规则失败"
@@ -475,10 +795,10 @@ delete_rule() {
     echo -e "${BOLD}${CYAN}  │      删除端口转发规则      │${NC}"
     echo -e "${BOLD}${CYAN}  └────────────────────────────┘${NC}"
 
-    local -a rules=()
-    load_rules_array rules
+    local -a groups=()
+    load_rule_groups_array groups
 
-    if [[ ${#rules[@]} -eq 0 ]]; then
+    if [[ ${#groups[@]} -eq 0 ]]; then
         info "当前暂无转发规则"
         return
     fi
@@ -487,52 +807,38 @@ delete_rule() {
     read -rp "  请输入要删除的序号（q 取消）: " choice
     [[ "$choice" == "q" || "$choice" == "Q" ]] && return
 
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 || "$choice" -gt ${#rules[@]} ]]; then
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 || "$choice" -gt ${#groups[@]} ]]; then
         warn "序号无效"; return
     fi
 
-    local rule="${rules[$((choice - 1))]}"
-    local proto lport dip dport
-    read -r proto lport dip dport <<< "$rule"
+    local group="${groups[$((choice - 1))]}"
+    local proto lport backends_str
+    read -r proto lport backends_str <<< "$group"
+    IFS=',' read -ra backends <<< "$backends_str"
 
     echo ""
-    echo -e "  将删除：${CYAN}${proto^^}${NC}  本地端口 ${BOLD}${lport}${NC}  →  ${dip}:${BOLD}${dport}${NC}"
+    echo -e "  将删除：${CYAN}${proto^^}${NC}  本地端口 ${BOLD}${lport}${NC}  →  ${#backends[@]} 个后端"
+    for b in "${backends[@]}"; do
+        echo -e "    ${DIM}├─${NC} $b"
+    done
     read -rp "  确认删除？[y/N] " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消"; return; }
 
-    local dnat_deleted=0 masquerade_deleted=0
-    if iptables -t nat -D PREROUTING -p "$proto" --dport "$lport" \
-           -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null; then
-        ok "已删除 DNAT 规则"
-        dnat_deleted=1
-    else
-        warn "DNAT 规则删除失败（可能已不存在）"
-    fi
-    if iptables -t nat -D POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
-           -j MASQUERADE 2>/dev/null; then
-        ok "已删除 MASQUERADE 规则"
-        masquerade_deleted=1
-    else
-        warn "MASQUERADE 规则删除失败（可能已不存在）"
-    fi
+    # 删除所有 NAT 规则
+    _remove_all_nat_rules_for_port "$proto" "$lport"
+    ok "已删除 NAT 规则（${#backends[@]} 个后端）"
 
-    if ! delete_forward_allow "$proto" "$dip" "$dport"; then
-        warn "FORWARD 放行规则删除失败，正在回滚 NAT 规则..."
-        if [[ $dnat_deleted -eq 1 ]]; then
-            iptables -t nat -A PREROUTING -p "$proto" --dport "$lport" \
-                -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null || true
-        fi
-        if [[ $masquerade_deleted -eq 1 ]]; then
-            iptables -t nat -A POSTROUTING -p "$proto" -d "$dip" --dport "$dport" \
-                -j MASQUERADE 2>/dev/null || true
-        fi
-        warn "已回滚 NAT 规则，请手动检查放行规则状态"
-        return
-    fi
+    # 删除 FORWARD 放行规则
+    for b in "${backends[@]}"; do
+        local bip bport
+        IFS=: read -r bip bport <<< "$b"
+        delete_forward_allow "$proto" "$bip" "$bport"
+    done
 
-    _delete_note "$proto" "$lport" "$dip" "$dport"
-
-    [[ $dnat_deleted -eq 1 || $masquerade_deleted -eq 1 ]] && save_rules
+    local first_bip first_bport
+    IFS=: read -r first_bip first_bport <<< "${backends[0]}"
+    _delete_note "$proto" "$lport" "$first_bip" "$first_bport"
+    save_rules
 }
 
 # ── 4. 修改规则 ───────────────────────────────────────────────
@@ -542,10 +848,10 @@ modify_rule() {
     echo -e "${BOLD}${CYAN}  │      修改端口转发规则      │${NC}"
     echo -e "${BOLD}${CYAN}  └────────────────────────────┘${NC}"
 
-    local -a rules=()
-    load_rules_array rules
+    local -a groups=()
+    load_rule_groups_array groups
 
-    if [[ ${#rules[@]} -eq 0 ]]; then
+    if [[ ${#groups[@]} -eq 0 ]]; then
         info "当前暂无转发规则"
         return
     fi
@@ -554,84 +860,173 @@ modify_rule() {
     read -rp "  请输入要修改的序号（q 取消）: " choice
     [[ "$choice" == "q" || "$choice" == "Q" ]] && return
 
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 || "$choice" -gt ${#rules[@]} ]]; then
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 || "$choice" -gt ${#groups[@]} ]]; then
         warn "序号无效"; return
     fi
 
-    local rule="${rules[$((choice - 1))]}"
-    local proto lport dip dport
-    read -r proto lport dip dport <<< "$rule"
+    local group="${groups[$((choice - 1))]}"
+    local proto lport backends_str
+    read -r proto lport backends_str <<< "$group"
+    IFS=',' read -ra old_backends <<< "$backends_str"
+    local old_mode
+    old_mode=$(_detect_lb_mode "$proto" "$lport")
 
     local cur_note
-    cur_note=$(_get_note "$proto" "$lport" "$dip" "$dport")
+    local first_bip first_bport
+    IFS=: read -r first_bip first_bport <<< "${old_backends[0]}"
+    cur_note=$(_get_note "$proto" "$lport" "$first_bip" "$first_bport")
 
     echo ""
-    echo -e "  当前规则：${CYAN}${proto^^}${NC}  本地:${BOLD}${lport}${NC}  →  ${dip}:${BOLD}${dport}${NC}"
+    echo -e "  当前规则：${CYAN}${proto^^}${NC}  本地:${BOLD}${lport}${NC}"
+    for b in "${old_backends[@]}"; do
+        echo -e "    ${DIM}├─${NC} $b"
+    done
     [[ -n "$cur_note" ]] && echo -e "  当前备注：${DIM}${cur_note}${NC}"
     echo -e "  ${DIM}（直接回车则保留当前值）${NC}"
     echo ""
 
-    read -rp "  新本地端口  [${lport}]: " new_lport
+    # 新本地端口
+    read -rp "  新本地端口 [${lport}]: " new_lport
     new_lport="${new_lport:-$lport}"
-
-    read -rp "  新目标 IP   [${dip}]: " new_dip
-    new_dip="${new_dip:-$dip}"
-
-    read -rp "  新目标端口  [${dport}]: " new_dport
-    new_dport="${new_dport:-$dport}"
-
-    local note_prompt="  新备注"
-    [[ -n "$cur_note" ]] && note_prompt+="      [${cur_note}]"
-    note_prompt+=": "
-    read -rp "$note_prompt" new_note
-    new_note="${new_note:-$cur_note}"
-
-    # 验证
     if ! [[ "$new_lport" =~ ^[0-9]+$ ]] || [[ "$new_lport" -lt 1 || "$new_lport" -gt 65535 ]]; then
         warn "本地端口无效"; return
     fi
-    if ! valid_ip "$new_dip"; then
-        warn "目标 IP 无效（需为合法 IPv4，每段 0-255）"; return
-    fi
-    if ! [[ "$new_dport" =~ ^[0-9]+$ ]] || [[ "$new_dport" -lt 1 || "$new_dport" -gt 65535 ]]; then
-        warn "目标端口无效"; return
+
+    if [[ "$new_lport" != "$lport" ]]; then
+        if get_rules | awk -v p="$proto" -v lp="$new_lport" '$1==p && $2==lp { found=1; exit } END { exit(found ? 0 : 1) }'; then
+            warn "本地端口 ${new_lport} 已有转发规则"
+            read -rp "  仍要继续修改？[y/N] " cont
+            [[ "$cont" =~ ^[Yy]$ ]] || return
+        fi
     fi
 
-    # 若无任何变更
-    if [[ "$new_lport" == "$lport" && "$new_dip" == "$dip" && "$new_dport" == "$dport" && "$new_note" == "$cur_note" ]]; then
-        info "规则无变化，已取消"; return
-    fi
-
+    # 重新输入后端（回车保留原后端）
     echo ""
-    echo -e "  修改前：${DIM}${proto^^}  ${lport}  →  ${dip}:${dport}${NC}"
-    echo -e "  修改后：${GREEN}${proto^^}  ${new_lport}  →  ${new_dip}:${new_dport}${NC}"
+    echo -e "  ${BOLD}重新输入后端节点${NC}（直接回车保留当前后端，或输入新后端列表）："
+    local -a new_backends=()
+    local bidx=0
+    while true; do
+        bidx=$((bidx + 1))
+        local default_hint=""
+        [[ $bidx -le ${#old_backends[@]} ]] && default_hint=" [${old_backends[$((bidx-1))]}]"
+        read -rp "  后端 ${bidx}${default_hint}: " input
+        if [[ -z "$input" ]]; then
+            # 空输入：若尚未输入任何后端，保留所有旧后端
+            if [[ ${#new_backends[@]} -eq 0 && $bidx -eq 1 ]]; then
+                new_backends=("${old_backends[@]}")
+                echo -e "  ${DIM}已保留当前全部 ${#old_backends[@]} 个后端${NC}"
+                for ob in "${old_backends[@]}"; do
+                    echo -e "    ${DIM}├─${NC} $ob"
+                done
+            fi
+            break
+        fi
+        # 支持 ip:port 或 ip port 两种格式
+        local bip bport
+        if [[ "$input" == *:* ]]; then
+            IFS=: read -r bip bport <<< "$input"
+        else
+            read -r bip bport <<< "$input"
+        fi
+        if ! valid_ip "$bip"; then
+            warn "IP 无效"; bidx=$((bidx - 1)); continue
+        fi
+        if ! [[ "$bport" =~ ^[0-9]+$ ]] || [[ "$bport" -lt 1 || "$bport" -gt 65535 ]]; then
+            warn "端口无效"; bidx=$((bidx - 1)); continue
+        fi
+        new_backends+=("${bip}:${bport}")
+        echo -e "  ${GREEN}✔${NC} 后端 ${bidx}: ${bip}:${bport}"
+    done
+
+    if [[ ${#new_backends[@]} -eq 0 ]]; then
+        warn "后端列表为空，已取消"; return
+    fi
+
+    # LB 模式
+    local new_mode="$old_mode"
+    if [[ ${#new_backends[@]} -gt 1 ]]; then
+        local mode_default=1
+        [[ "$old_mode" == "random" ]] && mode_default=2
+        echo ""
+        echo -e "  ${BOLD}负载均衡模式：${NC}"
+        echo "    1) 轮询 (nth)"
+        echo "    2) 随机 (random)"
+        read -rp "  请选择 [默认 ${mode_default}]: " mode_choice
+        case "$mode_choice" in
+            1) new_mode="nth" ;;
+            2) new_mode="random" ;;
+            *) [[ "$old_mode" == "random" ]] && new_mode="random" || new_mode="nth" ;;
+        esac
+    else
+        new_mode="nth"
+    fi
+
+    # 备注
+    local note_prompt="  新备注："
+    [[ -n "$cur_note" ]] && note_prompt="  新备注 [${cur_note}]: "
+    read -rp "$note_prompt" new_note
+    new_note="${new_note:-$cur_note}"
+
+    # 预览
+    echo ""
+    echo -e "  修改后：${GREEN}${proto^^}${NC}  本地:${BOLD}${new_lport}${NC}"
+    for b in "${new_backends[@]}"; do
+        echo -e "    ${GREEN}├─${NC} $b"
+    done
     echo ""
     read -rp "  确认修改？[y/N] " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消"; return; }
 
     # 删除旧规则
-    _remove_nat_rules "$proto" "$lport" "$dip" "$dport"
+    _remove_all_nat_rules_for_port "$proto" "$lport"
+    for b in "${old_backends[@]}"; do
+        local bip bport
+        IFS=: read -r bip bport <<< "$b"
+        delete_forward_allow "$proto" "$bip" "$bport"
+    done
 
-    # 添加新规则（失败则回滚旧规则）
-    if _add_nat_rules "$proto" "$new_lport" "$new_dip" "$new_dport"; then
-        if ensure_forward_allow "$proto" "$new_dip" "$new_dport"; then
-            if delete_forward_allow "$proto" "$dip" "$dport"; then
-                ok "规则已更新"
-                _delete_note "$proto" "$lport" "$dip" "$dport"
-                [[ -n "$new_note" ]] && _set_note "$proto" "$new_lport" "$new_dip" "$new_dport" "$new_note"
-            else
-                warn "旧 FORWARD 放行规则删除失败，正在回滚..."
-                _rollback_to_old_rule "$proto" "$lport" "$dip" "$dport" "$new_lport" "$new_dip" "$new_dport"
-                return
+    # 添加新规则
+    if _add_nat_rules_lb "$proto" "$new_lport" "$new_mode" "${new_backends[@]}"; then
+        local all_ok=1
+        for b in "${new_backends[@]}"; do
+            local bip bport
+            IFS=: read -r bip bport <<< "$b"
+            if ! ensure_forward_allow "$proto" "$bip" "$bport"; then
+                all_ok=0; break
             fi
+        done
+        if [[ $all_ok -eq 1 ]]; then
+            ok "规则已更新（${#new_backends[@]} 个后端）"
+            _delete_note "$proto" "$lport" "$first_bip" "$first_bport"
+            [[ -n "$new_note" ]] && _set_note "$proto" "$new_lport" "$new_note"
         else
-            warn "新 FORWARD 放行规则添加失败，正在回滚..."
-            _rollback_to_old_rule "$proto" "$lport" "$dip" "$dport" "$new_lport" "$new_dip" "$new_dport"
+            warn "FORWARD 放行规则添加失败，正在回滚..."
+            _remove_specific_nat_rules_lb "$proto" "$new_lport" "$new_mode" "${new_backends[@]}"
+            # 清理已成功添加的新 FORWARD 放行规则
+            for rb in "${new_backends[@]}"; do
+                local rbip rbport
+                IFS=: read -r rbip rbport <<< "$rb"
+                [[ "$rbip:$rbport" == "$bip:$bport" ]] && break
+                delete_forward_allow "$proto" "$rbip" "$rbport"
+            done
+            # 尝试恢复旧规则（NAT + FORWARD）
+            _add_nat_rules_lb "$proto" "$lport" "$old_mode" "${old_backends[@]}" 2>/dev/null
+            for rb in "${old_backends[@]}"; do
+                local rbip rbport
+                IFS=: read -r rbip rbport <<< "$rb"
+                ensure_forward_allow "$proto" "$rbip" "$rbport" 2>/dev/null
+            done
             return
         fi
     else
         warn "新 NAT 规则添加失败，正在回滚..."
-        _rollback_to_old_rule "$proto" "$lport" "$dip" "$dport" "$new_lport" "$new_dip" "$new_dport"
+        # 恢复旧规则（NAT + FORWARD）
+        _add_nat_rules_lb "$proto" "$lport" "$old_mode" "${old_backends[@]}" 2>/dev/null
+        for rb in "${old_backends[@]}"; do
+            local rbip rbport
+            IFS=: read -r rbip rbport <<< "$rb"
+            ensure_forward_allow "$proto" "$rbip" "$rbport" 2>/dev/null
+        done
         return
     fi
 
@@ -758,10 +1153,10 @@ export_rules() {
     echo -e "${BOLD}${CYAN}  └────────────────────────────────────────────────────────┘${NC}"
     echo ""
 
-    local -a rules=()
-    load_rules_array rules
+    local -a groups=()
+    load_rule_groups_array groups
 
-    if [[ ${#rules[@]} -eq 0 ]]; then
+    if [[ ${#groups[@]} -eq 0 ]]; then
         info "当前暂无转发规则"
         return
     fi
@@ -773,27 +1168,48 @@ export_rules() {
 
     {
         printf "#!/usr/bin/env bash\n"
-        printf "# FlowForward 转发规则导出\n"
+        printf "# FlowForward 转发规则导出（含负载均衡）\n"
         printf "# 导出时间：%s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
-        printf "# 规则数量：%d\n\n" "${#rules[@]}"
+        printf "# 规则组数量：%d\n\n" "${#groups[@]}"
 
         printf "# ── iptables NAT 规则 ──\n"
-        local proto lport dip dport note
-        for rule in "${rules[@]}"; do
-            read -r proto lport dip dport <<< "$rule"
-            note=$(_get_note "$proto" "$lport" "$dip" "$dport")
+        local proto lport backends_str
+        for group in "${groups[@]}"; do
+            read -r proto lport backends_str <<< "$group"
+            IFS=',' read -ra backends <<< "$backends_str"
+
+            # 获取备注（兼容 v1 旧 key）
+            local first_bip first_bport
+            IFS=: read -r first_bip first_bport <<< "${backends[0]}"
+            local note
+            note=$(_get_note "$proto" "$lport" "$first_bip" "$first_bport")
             [[ -n "$note" ]] && printf "\n# %s\n" "$note" || printf "\n"
-            printf "iptables -t nat -A PREROUTING -p %s -m %s --dport %s -j DNAT --to-destination %s:%s\n" \
-                "$proto" "$proto" "$lport" "$dip" "$dport"
-            printf "iptables -t nat -A POSTROUTING -d %s/32 -p %s -m %s --dport %s -j MASQUERADE\n" \
-                "$dip" "$proto" "$proto" "$dport"
+
+            printf "# %s 本地:%s → %d 个后端\n" "${proto^^}" "$lport" "${#backends[@]}"
+
+            # 提取该规则组对应的 PREROUTING DNAT 规则
+            while IFS= read -r rule_line; do
+                [[ -z "$rule_line" ]] && continue
+                printf "iptables -t nat %s\n" "$rule_line"
+            done < <(iptables-save -t nat 2>/dev/null | grep "^-A PREROUTING" | grep -E "\-p $proto" | grep "\-\-dport $lport " | grep "\-j DNAT")
+
+            # 仅导出该规则组后端对应的 MASQUERADE 规则
+            for backend in "${backends[@]}"; do
+                local bip bport
+                IFS=: read -r bip bport <<< "$backend"
+                printf "iptables -t nat -A POSTROUTING -p %s -d %s --dport %s -j MASQUERADE\n" \
+                    "$proto" "$bip" "$bport"
+            done
         done
 
         if [[ $UFW_ACTIVE -eq 1 ]]; then
             printf "\n# ── UFW 路由放行规则 ──\n"
+            local -a rules=()
+            load_rules_array rules
+            local r_proto r_lport r_dip r_dport
             for rule in "${rules[@]}"; do
-                read -r proto lport dip dport <<< "$rule"
-                printf "ufw route allow proto %s to %s port %s\n" "$proto" "$dip" "$dport"
+                read -r r_proto r_lport r_dip r_dport <<< "$rule"
+                printf "ufw route allow proto %s to %s port %s\n" "$r_proto" "$r_dip" "$r_dport"
             done
         fi
 
@@ -895,12 +1311,12 @@ uninstall_script() {
         return
     fi
 
-    local -a rules=()
-    load_rules_array rules
+    local -a groups=()
+    load_rule_groups_array groups
     local rule_choice=1
 
-    if [[ ${#rules[@]} -gt 0 ]]; then
-        echo -e "  ${YELLOW}检测到当前存在 ${#rules[@]} 条转发规则：${NC}"
+    if [[ ${#groups[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}检测到当前存在 ${#groups[@]} 组转发规则：${NC}"
         echo ""
         show_rules
         echo ""
@@ -925,12 +1341,17 @@ uninstall_script() {
     # 清除转发规则
     if [[ "$rule_choice" == "2" ]]; then
         info "正在清除所有转发规则..."
-        local proto lport dip dport
-        for rule in "${rules[@]}"; do
-            read -r proto lport dip dport <<< "$rule"
-            _remove_nat_rules "$proto" "$lport" "$dip" "$dport"
-            delete_forward_allow "$proto" "$dip" "$dport"
-            _delete_note "$proto" "$lport" "$dip" "$dport"
+        for group in "${groups[@]}"; do
+            local proto lport backends_str
+            read -r proto lport backends_str <<< "$group"
+            _remove_all_nat_rules_for_port "$proto" "$lport"
+            IFS=',' read -ra backends <<< "$backends_str"
+            for b in "${backends[@]}"; do
+                local bip bport
+                IFS=: read -r bip bport <<< "$b"
+                delete_forward_allow "$proto" "$bip" "$bport"
+            done
+            _delete_note "$proto" "$lport"
         done
         local nat_rules_file="/etc/iptables/rules.v4"
         [[ -f "$nat_rules_file" ]] && rm -f "$nat_rules_file" && ok "已删除 $nat_rules_file"
@@ -958,7 +1379,7 @@ uninstall_script() {
 
     echo ""
     ok "卸载完成"
-    if [[ "$rule_choice" == "1" && ${#rules[@]} -gt 0 ]]; then
+    if [[ "$rule_choice" == "1" && ${#groups[@]} -gt 0 ]]; then
         warn "注意：现有转发规则仍在内存中生效，重启后将消失"
     fi
     echo ""
@@ -974,14 +1395,14 @@ main_menu() {
         clear
         echo ""
         echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════╗${NC}"
-        echo -e "${BOLD}${BLUE}  ║        端口转发管理工具 v1.0         ║${NC}"
+        echo -e "${BOLD}${BLUE}  ║        端口转发管理工具 v1.1         ║${NC}"
         echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════╝${NC}"
         echo ""
 
         # 状态栏
         local ip_fwd rule_count
         ip_fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "0")
-        rule_count=$(get_rules | wc -l)
+        rule_count=$(get_rule_groups | wc -l)
 
         if [[ "$ip_fwd" == "1" ]]; then
             echo -e "  IP 转发：${GREEN}● 已启用${NC}    规则数量：${BOLD}${rule_count}${NC} 条"
